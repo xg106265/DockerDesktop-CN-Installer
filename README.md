@@ -27,6 +27,8 @@ bash localize.command
 
 环境变量：`DDCN_REPO` 汉化仓库，`DDCN_PROXY_PREFIX` 下载加速前缀，`DDCN_DOCKER_APP` Docker.app 路径，`NO_LAUNCH=1` 安装后不启动 Docker。
 
+后台任务读不到终端里的环境变量，需要持久生效的设置请写入 `~/Library/Application Support/DockerDesktop-CN/config`（每行 `KEY=VALUE`，支持前三项）；执行 `--install-agent` 时会自动把当前生效的非默认设置写进去。
+
 ## Docker 升级后
 
 升级会覆盖汉化。手动再运行一次脚本，或执行一次 `--install-agent` 让它自动完成。汉化包通常在 Docker 新版本发布后一两天内出现；在此之前脚本只提示“尚未发布”，不会改动任何文件，也不会用其他版本的包代替（版本不符会导致 Docker 无法启动）。
@@ -47,6 +49,8 @@ bash localize.command
 - **需要 App 管理权限。** 在 系统设置 › 隐私与安全性 › App 管理 中允许所用终端（后台任务需允许 `/bin/bash`），否则写入报 `Operation not permitted`。
 - **`codesign` 提示 `invalid Info.plist` 属预期**，脚本只改动该文件的完整性哈希，绝不向 `.app` 内写入其他文件（多出任何文件都会触发“已损坏”）。
 - **信任第三方汉化包。** 它会替换 Docker Desktop 的前端代码；SHA256 只防下载损坏，不能证明来源可信。请确认你信任 `--repo` 指定的仓库。
+- **重装系统 / 迁移 / 换用户名**：脚本不依赖固定路径。Docker 位置按 `/Applications`、`~/Applications`、Spotlight（bundle id）依次查找；状态文件里的备份路径失效时会自动到备份目录重新定位，状态丢失时按哈希找回备份，已是汉化版的 app 会被直接认领。全新系统上只需：安装 Docker → 启动一次并退出 → 运行脚本。
+- Docker.app 属于 root 或其他用户时，用 `sudo bash localize.command`；状态和备份仍记在你自己的家目录下。
 - 仅支持 macOS；Windows 请使用汉化仓库 Release 中的 `app-Windows-*.zip`。
 
 遇到“已损坏”等问题见 [docs/troubleshooting.md](docs/troubleshooting.md)。

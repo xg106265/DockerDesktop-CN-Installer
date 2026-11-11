@@ -23,15 +23,29 @@
 #   NO_LAUNCH=1        安装后不自动启动 Docker
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.0.0"
-REPO="${DDCN_REPO:-asxez/DockerDesktop-CN}"
+INSTALLER_VERSION="1.1.0"
+
+# 以 sudo 运行时 $HOME 可能是 root 的家目录；状态、备份应归属真实用户
+if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    _h="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    [[ -n "$_h" ]] && HOME="$_h"
+fi
+
 STATE_DIR="${DDCN_HOME:-$HOME/Library/Application Support/DockerDesktop-CN}"
 STATE_FILE="$STATE_DIR/state.json"
+CONFIG_FILE="$STATE_DIR/config"
 BACKUP_ROOT="$STATE_DIR/backup"
 AGENT_LABEL="com.dockerdesktop-cn.autolocalize"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
-AGENT_LOG="$HOME/Library/Logs/DockerDesktop-CN-auto.log"
 AGENT_SCRIPT="$STATE_DIR/localize.command"
+
+# 持久配置 (后台任务拿不到你终端里的环境变量): $STATE_DIR/config，每行 KEY=VALUE，
+# 支持 DDCN_REPO / DDCN_PROXY_PREFIX / DDCN_DOCKER_APP；环境变量优先于配置文件
+cfg_get() { sed -n "s/^$1=//p" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^"\(.*\)"$/\1/' || true; }
+[[ -n "${DDCN_REPO:-}" ]] || DDCN_REPO="$(cfg_get DDCN_REPO)"
+[[ -n "${DDCN_PROXY_PREFIX:-}" ]] || DDCN_PROXY_PREFIX="$(cfg_get DDCN_PROXY_PREFIX)"
+[[ -n "${DDCN_DOCKER_APP:-}" ]] || DDCN_DOCKER_APP="$(cfg_get DDCN_DOCKER_APP)"
+REPO="${DDCN_REPO:-asxez/DockerDesktop-CN}"
 
 MODE=install; FORCE=0; AUTO=0; YES=0; VERSION=""; LOCAL_ZIP=""
 while [[ $# -gt 0 ]]; do
@@ -78,12 +92,31 @@ ask() {  # ask "问题" -> 0=是 1=否 (自动/--yes 模式默认是)
 }
 
 # ---------------------------------------------------------------- 定位 Docker
+app_ok() { [[ -f "$1/Contents/MacOS/Docker Desktop.app/Contents/Resources/app.asar" ]]; }
 find_app() {
     local c
     for c in "${DDCN_DOCKER_APP:-}" /Applications/Docker.app "$HOME/Applications/Docker.app"; do
-        [[ -n "$c" && -f "$c/Contents/MacOS/Docker Desktop.app/Contents/Resources/app.asar" ]] && { echo "$c"; return 0; }
+        if [[ -n "$c" ]] && app_ok "$c"; then echo "$c"; return 0; fi
     done
+    # 兜底: 用 Spotlight 按 bundle id 查找 (自定义安装位置、外置磁盘等)
+    while IFS= read -r c; do
+        if [[ -n "$c" ]] && app_ok "$c"; then echo "$c"; return 0; fi
+    done < <(mdfind "kMDItemCFBundleIdentifier == 'com.docker.docker'" 2>/dev/null || true)
     return 1
+}
+missing_msg() {
+    if [[ -d /Applications/Docker.app || -d "${DDCN_DOCKER_APP:-/nonexistent}" ]]; then
+        echo "找到了 Docker.app，但其中没有预期的 app.asar (Docker 可能改变了目录结构，请到本仓库提 issue)"
+    else
+        echo "未找到 Docker Desktop。请先安装并至少启动一次；若装在特殊位置，请设置 DDCN_DOCKER_APP=/path/to/Docker.app"
+    fi
+}
+pick_arch() {  # $1 = lipo -archs 的输出; 通用二进制/无法识别时按本机芯片
+    case "$1" in
+        arm64) echo apple ;;
+        x86_64) echo intel ;;
+        *) if [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == "1" ]]; then echo apple; else echo intel; fi ;;
+    esac
 }
 
 [[ "$(uname)" == "Darwin" ]] || die "目前仅支持 macOS (Windows 请直接使用汉化仓库 Release 里的 app-Windows-*.zip)"
@@ -103,6 +136,37 @@ state_write() {  # pristine_dir patched_sha256 version source
         "$1" "$2" "$3" "$4" > "$STATE_FILE"
 }
 
+# 状态里记录的是绝对路径；换用户名/迁移/恢复备份后路径会失效，这里按目录名到当前备份目录重新定位
+resolve_pristine() {
+    local p alt; p="$(state_get pristine_dir)"
+    [[ -n "$p" ]] || return 0
+    if [[ -f "$p/app.asar" ]]; then echo "$p"; return 0; fi
+    alt="$BACKUP_ROOT/$(basename "$p")"
+    if [[ -f "$alt/app.asar" ]]; then echo "$alt"; fi
+    return 0
+}
+# 状态文件丢失时: 扫描备份目录，找 app.asar 哈希与目标一致的原版备份
+scan_backup_for() {  # $1 = 目标 app.asar 的 sha256
+    local d
+    for d in $(ls -1dr "$BACKUP_ROOT"/*-orig-* 2>/dev/null || true); do
+        if [[ -f "$d/app.asar" && "$(sha256_of "$d/app.asar")" == "$1" ]]; then echo "$d"; return 0; fi
+    done
+    return 0
+}
+own_state() {  # sudo 运行时把状态/备份的属主还给真实用户
+    if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && -d "$STATE_DIR" ]]; then
+        chown -R "$SUDO_USER" "$STATE_DIR" 2>/dev/null || true
+    fi
+}
+scan_backup_version() {  # 状态丢失时: 取同版本的最新备份 (用于认领已汉化的 app，恢复“可还原”能力)
+    local d
+    for d in $(ls -1dr "$BACKUP_ROOT"/*-orig-"$1" 2>/dev/null || true); do
+        if [[ -f "$d/app.asar" ]]; then echo "$d"; return 0; fi
+    done
+    return 0
+}
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 # ---------------------------------------------------------------- 后台任务
 if [[ "$MODE" == "uninstall-agent" ]]; then
     launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
@@ -110,9 +174,18 @@ if [[ "$MODE" == "uninstall-agent" ]]; then
     say "已卸载自动汉化后台任务"; exit 0
 fi
 if [[ "$MODE" == "install-agent" ]]; then
-    APP="$(find_app)" || die "未找到 Docker Desktop，请先安装"
-    mkdir -p "$STATE_DIR" "$(dirname "$AGENT_PLIST")" "$(dirname "$AGENT_LOG")"
+    APP="$(find_app)" || die "$(missing_msg)"
+    mkdir -p "$STATE_DIR" "$(dirname "$AGENT_PLIST")" "$HOME/Library/Logs"
     cp -f "$0" "$AGENT_SCRIPT"; chmod +x "$AGENT_SCRIPT"   # 后台任务用固定位置的副本，不依赖你把仓库放在哪
+    # 把当前生效的非默认设置写入配置文件，后台任务才能用上 (如代理、自定义 Docker 路径)
+    { [[ "$REPO" != "asxez/DockerDesktop-CN" ]] && echo "DDCN_REPO=$REPO"
+      [[ -n "${DDCN_PROXY_PREFIX:-}" ]] && echo "DDCN_PROXY_PREFIX=$DDCN_PROXY_PREFIX"
+      [[ -n "${DDCN_DOCKER_APP:-}" ]] && echo "DDCN_DOCKER_APP=$DDCN_DOCKER_APP"
+      true; } > "$CONFIG_FILE.new"
+    if [[ -s "$CONFIG_FILE.new" ]]; then mv "$CONFIG_FILE.new" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE.new"; fi
+    # 命令里用 $HOME 动态展开，而不是写死安装时的家目录，换用户名/迁移后仍然有效
+    CMD_DIR="$STATE_DIR"; [[ "$STATE_DIR" == "$HOME"/* ]] && CMD_DIR="\$HOME${STATE_DIR#"$HOME"}"
+    AGENT_CMD="mkdir -p \"\$HOME/Library/Logs\"; exec \"$CMD_DIR/localize.command\" --auto >> \"\$HOME/Library/Logs/DockerDesktop-CN-auto.log\" 2>&1"
     cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -120,13 +193,11 @@ if [[ "$MODE" == "install-agent" ]]; then
 <dict>
     <key>Label</key><string>$AGENT_LABEL</string>
     <key>ProgramArguments</key>
-    <array><string>/bin/bash</string><string>$AGENT_SCRIPT</string><string>--auto</string></array>
+    <array><string>/bin/bash</string><string>-c</string><string>$(xml_esc "$AGENT_CMD")</string></array>
     <key>RunAtLoad</key><true/>
     <key>StartInterval</key><integer>3600</integer>
-    <key>WatchPaths</key><array><string>$APP/Contents/Info.plist</string></array>
+    <key>WatchPaths</key><array><string>$(xml_esc "$APP/Contents/Info.plist")</string></array>
     <key>ThrottleInterval</key><integer>300</integer>
-    <key>StandardOutPath</key><string>$AGENT_LOG</string>
-    <key>StandardErrorPath</key><string>$AGENT_LOG</string>
 </dict>
 </plist>
 PLIST
@@ -134,31 +205,27 @@ PLIST
     launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
     launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"
     say "已安装后台任务: 登录时、每小时、Docker.app 更新时自动检查，汉化失效就重新汉化"
-    info "日志: $AGENT_LOG"
+    info "日志: ~/Library/Logs/DockerDesktop-CN-auto.log"
     warn "后台运行同样需要 App 管理权限；日志里出现 Operation not permitted 时，请到"
     warn "系统设置 > 隐私与安全性 > App 管理 中允许 /bin/bash"
     exit 0
 fi
 
 # ---------------------------------------------------------------- 基本信息
-APP="$(find_app)" || { [[ "$MODE" == "check" ]] && { echo "未找到 Docker Desktop"; exit 11; }; \
-    [[ $AUTO -eq 1 ]] && exit 0; die "未找到 Docker Desktop，请先安装并至少启动一次"; }
+APP="$(find_app)" || { [[ "$MODE" == "check" ]] && { missing_msg; exit 11; }; \
+    [[ $AUTO -eq 1 ]] && exit 0; die "$(missing_msg)"; }
 INNER="$APP/Contents/MacOS/Docker Desktop.app/Contents"
 RES="$INNER/Resources"
 INFO="$INNER/Info.plist"
 
 INSTALLED_VERSION="$(plist_get "$INFO" CFBundleShortVersionString)"
 INSTALLED_BUILD="$(plist_get "$INFO" CFBundleVersion)"
+[[ -n "$INSTALLED_VERSION" ]] || die "无法读取 Docker Desktop 的版本号 ($INFO)，安装可能不完整，请重新安装"
 [[ -n "$VERSION" ]] || VERSION="$INSTALLED_VERSION"
 
 case "${DDCN_ARCH:-}" in
     apple|intel) ARCH="$DDCN_ARCH" ;;
-    *)
-        case "$(lipo -archs "$INNER/MacOS/Docker Desktop" 2>/dev/null || true)" in
-            *arm64*) ARCH=apple ;;
-            *x86_64*) ARCH=intel ;;
-            *) [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == "1" ]] && ARCH=apple || ARCH=intel ;;
-        esac ;;
+    *) ARCH="$(pick_arch "$(lipo -archs "$INNER/MacOS/Docker Desktop" 2>/dev/null || true)")" ;;
 esac
 ASSET="app-Mac-$ARCH.zip"
 
@@ -191,12 +258,15 @@ seal_extras() { codesign --verify --deep --strict -vv "$APP" 2>&1 | grep -E "^fi
 
 # ---------------------------------------------------------------- 还原
 IN_WRITE=0
+replace_dir() {  # replace_dir <src_dir> <dst_dir>: 用 src 的内容替换 dst (幂等；即使 dst 删除到一半失败也不会嵌套)
+    rm -rf "$2" 2>/dev/null || true
+    mkdir -p "$2"
+    cp -R "$1/." "$2/"
+}
 restore_from() {  # restore_from <pristine_dir>
     local d="$1"
     cp -f "$d/app.asar" "$RES/app.asar"
-    if [[ -d "$d/app.asar.unpacked" ]]; then
-        rm -rf "$RES/app.asar.unpacked"; cp -R "$d/app.asar.unpacked" "$RES/app.asar.unpacked"
-    fi
+    if [[ -d "$d/app.asar.unpacked" ]]; then replace_dir "$d/app.asar.unpacked" "$RES/app.asar.unpacked"; fi
     if [[ -f "$d/Info.plist" ]] && ! cmp -s "$d/Info.plist" "$INFO"; then cp -f "$d/Info.plist" "$INFO"; fi
     return 0
 }
@@ -212,7 +282,7 @@ on_err() {
 trap on_err ERR
 
 if [[ "$MODE" == "restore" ]]; then
-    PRISTINE="$(state_get pristine_dir)"
+    PRISTINE="$(resolve_pristine)"
     [[ -n "$PRISTINE" && -f "$PRISTINE/app.asar" ]] || die "没有找到原版备份，无法还原"
     cur="$(sha256_of "$RES/app.asar")"
     if [[ "$cur" != "$(state_get patched_sha256)" && "$cur" != "$(sha256_of "$PRISTINE/app.asar")" ]]; then
@@ -225,6 +295,7 @@ if [[ "$MODE" == "restore" ]]; then
     fi
     restore_from "$PRISTINE"
     state_write "$PRISTINE" "" "$INSTALLED_VERSION" ""
+    own_state
     say "已还原为原版 ($PRISTINE)"; exit 0
 fi
 
@@ -253,20 +324,18 @@ if [[ -z "${DDCN_ASSUME_LAUNCHED:-}" ]] \
     ask "仍要继续吗？" || { echo "已取消"; exit 1; }
 fi
 
-# 2) 当前 .app 必须是“没被改过的原版”（或之前由本脚本汉化过），否则备份到的就不是原版
+# 2) 包内不能有多余/缺失的文件 (签名封印已破坏时，系统启动会报“已损坏”)
 BSTATE="$(bundle_state)"
-case "$BSTATE" in
-    broken)
-        warn "Docker.app 的签名封印已被破坏，下面这些文件是多出来/缺失的:"
-        seal_extras | sed 's/^/    /'
-        die "请先删除多余文件，或重新安装 Docker Desktop 后再汉化 (见 docs/troubleshooting.md)" ;;
-    plist)
-        if [[ -z "$(state_get pristine_dir)" ]]; then
-            warn "Docker.app 的 Info.plist 已被改动过 (可能用过其他汉化工具)，现在备份到的将不是纯原版。"
-            [[ $AUTO -eq 1 ]] && { notify "检测到被其他工具改过，已跳过自动汉化"; exit 0; }
-            ask "建议先重装原版 Docker。仍要继续吗？" || { echo "已取消"; exit 1; }
-        fi ;;
-esac
+if [[ "$BSTATE" == "broken" ]]; then
+    warn "Docker.app 的签名封印已被破坏，下面这些文件是多出来/缺失的:"
+    seal_extras | sed 's/^/    /'
+    die "请先删除多余文件，或重新安装 Docker Desktop 后再汉化 (见 docs/troubleshooting.md)"
+fi
+
+# 3) 写权限预检 (Docker.app 属于 root/其他用户时需要 sudo)
+if [[ ! -w "$RES" || ! -w "$RES/app.asar" || ! -w "$INFO" ]]; then
+    die "没有修改 Docker.app 的权限 (它可能属于其他用户或 root)。请用 sudo 运行: sudo bash $(basename "$0")"
+fi
 
 # ---------------------------------------------------------------- 获取汉化包
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ddcn.XXXXXX")"
@@ -352,11 +421,34 @@ fi
 
 # ---------------------------------------------------------------- 备份原版并安装
 cur_sha="$(sha256_of "$RES/app.asar")"
-PRISTINE="$(state_get pristine_dir)"
-if [[ -n "$PRISTINE" && -f "$PRISTINE/app.asar" && \
-      ( "$cur_sha" == "$(state_get patched_sha256)" || "$cur_sha" == "$(sha256_of "$PRISTINE/app.asar")" ) ]]; then
+
+# 本机已经装着这个汉化包，只是状态记录丢了 (重装系统/迁移/清理 ~/Library 之后常见): 认领并重建记录，不再重复下载安装
+if [[ $FORCE -eq 0 && "$cur_sha" == "$(sha256_of "$PKG/app.asar")" \
+      && "$(asar_header_hash "$RES/app.asar")" == "$(plist_get "$INFO" ElectronAsarIntegrity:Resources/app.asar:hash)" ]]; then
+    PRISTINE="$(resolve_pristine)"; [[ -n "$PRISTINE" ]] || PRISTINE="$(scan_backup_version "$INSTALLED_VERSION")"
+    state_write "${PRISTINE:-}" "$cur_sha" "$INSTALLED_VERSION" "$REPO@$VERSION ${ASSET_SHA:-local}"
+    own_state
+    say "本机已经是该汉化包，已重建状态记录，无需重新安装"
+    [[ -n "${PRISTINE:-}" ]] || info "未找到原版备份；之后想还原原版，请重新安装 Docker Desktop"
+    exit 0
+fi
+
+PRISTINE="$(resolve_pristine)"; REUSE=0
+if [[ -n "$PRISTINE" && ( "$cur_sha" == "$(state_get patched_sha256)" || "$cur_sha" == "$(sha256_of "$PRISTINE/app.asar")" ) ]]; then
+    REUSE=1
+else
+    FOUND="$(scan_backup_for "$cur_sha")"   # 状态丢失/路径失效时，按哈希找回已有的原版备份
+    if [[ -n "$FOUND" ]]; then PRISTINE="$FOUND"; REUSE=1; fi
+fi
+if [[ $REUSE -eq 1 ]]; then
     info "复用已有的原版备份: $PRISTINE"
 else
+    # 要把当前文件当作“原版”备份了: 如果 Info.plist 已经被改过，备份到的就不是纯原版
+    if [[ "$BSTATE" == "plist" ]]; then
+        warn "Docker.app 的 Info.plist 已被改动过 (可能用过其他汉化工具)，现在备份到的将不是纯原版，--restore 也只能还原到这个状态。"
+        if [[ $AUTO -eq 1 ]]; then notify "检测到被其他工具改过，已跳过自动汉化"; exit 0; fi
+        ask "建议先重装原版 Docker。仍要继续吗？" || { echo "已取消"; exit 1; }
+    fi
     PRISTINE="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-orig-$INSTALLED_VERSION"
     mkdir -p "$PRISTINE"
     cp -f "$RES/app.asar" "$PRISTINE/app.asar"
@@ -380,14 +472,17 @@ fi
 say "安装汉化"
 IN_WRITE=1
 if ! cp -f "$PKG/app.asar" "$RES/app.asar" 2>"$WORK/err"; then
+    if grep -q "Permission denied" "$WORK/err"; then
+        die "没有修改 Docker.app 的权限，请用 sudo 运行: sudo bash $(basename "$0")"
+    fi
     if grep -q "not permitted" "$WORK/err"; then
         die "macOS 拒绝修改 Docker.app (App 管理保护)。请到 系统设置 > 隐私与安全性 > App 管理 中允许当前使用的终端，然后重试"
     fi
     cat "$WORK/err" >&2; false
 fi
 if [[ -d "$PKG/app.asar.unpacked" ]]; then
-    rm -rf "$RES/app.asar.unpacked"
-    cp -R "$PKG/app.asar.unpacked" "$RES/app.asar.unpacked"
+    rm -rf "$RES/app.asar.unpacked"   # 删不干净就让安装失败并回滚 (此处不能忽略错误)
+    replace_dir "$PKG/app.asar.unpacked" "$RES/app.asar.unpacked"
 fi
 # 只更新完整性哈希，不整体替换 Info.plist；绝不往 .app 包里放备份等额外文件，否则会破坏签名封印
 /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $NEW_HASH" "$INFO" 2>/dev/null \
@@ -402,6 +497,7 @@ IN_WRITE=0
 [[ "$(asar_header_hash "$RES/app.asar")" == "$(plist_get "$INFO" ElectronAsarIntegrity:Resources/app.asar:hash)" ]] \
     || { IN_WRITE=1; die "写入后完整性校验值不一致"; }
 state_write "$PRISTINE" "$(sha256_of "$RES/app.asar")" "$INSTALLED_VERSION" "$REPO@$VERSION ${ASSET_SHA:-local}"
+own_state
 EXTRAS="$(seal_extras)"
 if [[ -n "$EXTRAS" ]]; then
     warn "检测到 .app 包内有多余/缺失的文件，启动时可能提示“已损坏”:"; printf '%s\n' "$EXTRAS" | sed 's/^/    /'
