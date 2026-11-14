@@ -14,7 +14,7 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/ddcn-test.XXXXXX")"
 trap 'chflags -R nouchg "$T" 2>/dev/null; /bin/rm -rf "$T"' EXIT
 VER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ORIG/Info.plist")"
 echo "原版: $ORIG (Docker Desktop $VER)"
-APP="$T/Docker.app"; F="$APP/Contents/MacOS/Docker Desktop.app/Contents"
+APP="$T/Docker.app"; INNERAPP="$APP/Contents/MacOS/Docker Desktop.app"; F="$INNERAPP/Contents"
 PASS=0; FAILN=0
 ok()   { echo "  ✔ $*"; PASS=$((PASS+1)); }
 bad()  { echo "  ✘ $*"; FAILN=$((FAILN+1)); }
@@ -24,7 +24,9 @@ c()    { sed 's/\x1b\[[0-9;]*m//g' | tr '\r' '\n' | grep -v -E '^ *#|^ *[0-9.]+%
 reset_fake() {  # 把假 app 复位成原版
     /bin/rm -rf "$APP"; mkdir -p "$F/Resources" "$F/MacOS"
     cp "$ORIG/Info.plist" "$F/Info.plist"; cp "$ORIG/app.asar" "$F/Resources/"; cp -R "$ORIG/app.asar.unpacked" "$F/Resources/"
+    cp /usr/bin/true "$F/MacOS/Docker Desktop"   # 可签名的占位主程序 (CFBundleExecutable)
 }
+sig_valid() { codesign --verify --deep --strict "$INNERAPP" >/dev/null 2>&1 && codesign -dv "$INNERAPP" 2>&1 | grep -q "^Signature=adhoc"; }
 run() {  # run <home> args...  (在指定的“家目录/状态目录”下运行)
     local h=$1; shift
     DDCN_DOCKER_APP="$APP" DDCN_HOME="$h" DDCN_ARCH=apple DDCN_ASSUME_LAUNCHED=1 DDCN_AUTO_DELAY=1 NO_LAUNCH=1 bash "$INST" "$@" 2>&1 | c
@@ -36,6 +38,7 @@ echo "== 基线: 干净安装"
 reset_fake; H1=$T/home1
 run $H1 --yes | tail -2
 chk "安装后为已汉化" '[[ $(rc $H1 --check) -eq 0 ]]'
+chk "安装后已重新签名且签名与内容一致 (重启后系统才不会杀进程)" 'sig_valid'
 
 echo "== H1 路径变了: 状态里的绝对备份路径失效 (换用户名/迁移/恢复备份)"
 H1b=$T/home1_moved; cp -R $H1 $H1b            # 模拟迁到新位置
@@ -43,6 +46,7 @@ H1b=$T/home1_moved; cp -R $H1 $H1b            # 模拟迁到新位置
 grep -q "home1/backup" $H1b/state.json && ok "state.json 里确实还是旧路径" || bad "前提不成立"
 run $H1b --restore | tail -1
 chk "仍能定位到备份并还原为原版" 'cmp -s "$F/Resources/app.asar" "$ORIG/app.asar"'
+chk "还原后签名与(原版)内容仍一致" 'sig_valid'
 
 echo "== H2 状态文件丢了，但 app 已是汉化版 (认领，不重复安装)"
 run $H1b --yes >/dev/null                      # 再汉化一次
@@ -89,6 +93,27 @@ chk "unpacked 与原版逐字节一致且没有嵌套目录" 'diff -r "$F/Resour
 chk "Info.plist 保持原版" 'cmp -s "$F/Info.plist" "$ORIG/Info.plist"'
 chk "回滚后状态仍为未汉化" '[[ $(rc $H10 --check) -eq 10 ]]'
 chflags -R nouchg "$F" 2>/dev/null
+
+echo "== S1 旧版脚本装的汉化: 内容已写入但没有重新签名 -> --check 报需修复，运行脚本只补签名、不重新下载"
+reset_fake; H12=$T/home12
+run $H12 --yes >/dev/null
+codesign --remove-signature "$INNERAPP/Contents/MacOS/Docker Desktop" 2>/dev/null; codesign --remove-signature "$INNERAPP" 2>/dev/null
+chk "签名被移除后，--check 判为需要修复 (退出码 10)" '[[ $(rc $H12 --check) -eq 10 ]]'
+SHA_BEFORE=$(sha "$F/Resources/app.asar")
+OUT=$(run $H12 --yes); echo "$OUT" | grep -E "修复|下载" | head -2
+chk "只修复签名，没有重新下载" 'echo "$OUT" | grep -q "修复签名" && ! echo "$OUT" | grep -q "下载 app-Mac"'
+chk "汉化内容未改动" '[[ "$(sha "$F/Resources/app.asar")" == "$SHA_BEFORE" ]]'
+chk "修复后签名一致且 --check 为已汉化" 'sig_valid && [[ $(rc $H12 --check) -eq 0 ]]'
+chk "修复过的状态再次运行为“无需处理”" 'run $H12 --yes | grep -q "无需处理"'
+
+echo "== S2 重新签名失败 -> 自动回滚到原版 (用桩 codesign 模拟被 App 管理拦截)"
+reset_fake; H13=$T/home13; mkdir -p $T/stubs
+printf '#!/bin/bash\nfor a in "$@"; do [[ "$a" == "--force" ]] && { echo "stub: Operation not permitted" >&2; exit 1; }; done\nexec /usr/bin/codesign "$@"\n' > $T/stubs/codesign; chmod +x $T/stubs/codesign
+OUT=$(PATH="$T/stubs:$PATH"; run $H13 --yes); echo "$OUT" | tail -3
+chk "确实走到了重新签名这一步" 'echo "$OUT" | grep -q "重新签名"'
+chk "报错并触发回滚" 'echo "$OUT" | grep -qE "自动还原"'
+chk "asar / Info.plist / unpacked 全部回到原版" 'cmp -s "$F/Resources/app.asar" "$ORIG/app.asar" && cmp -s "$F/Info.plist" "$ORIG/Info.plist" && diff -r "$F/Resources/app.asar.unpacked" "$ORIG/app.asar.unpacked" >/dev/null'
+chk "回滚后状态为未汉化" '[[ $(rc $H13 --check) -eq 10 ]]'
 
 echo "== H11 配置文件: 持久指定汉化仓库 (后台任务拿不到环境变量)"
 reset_fake; H11=$T/home11; mkdir -p $H11; echo "DDCN_REPO=nobody/nonexistent-repo-xyz" > $H11/config

@@ -18,7 +18,7 @@ bash localize.command
 | 命令 | 说明 |
 |---|---|
 | `./localize.command` | 汉化；已汉化则无操作 |
-| `--check` | 仅检查状态，退出码 `0` 已汉化 / `10` 未汉化 / `11` 未找到 Docker |
+| `--check` | 仅检查状态，退出码 `0` 已汉化 / `10` 未汉化或需修复 / `11` 未找到 Docker |
 | `--restore` | 还原为原版 |
 | `--force` | 已汉化时强制重新安装 |
 | `--auto` | 无交互：仅在汉化失效时下载并重装 |
@@ -39,7 +39,8 @@ bash localize.command
 2. 经 GitHub API 取得 `app-Mac-{apple,intel}.zip` 的地址与 SHA256，下载并校验。
 3. 校验汉化包版本、构建号与本机一致，`app.asar` 头部哈希与包内记录一致。
 4. 备份原版；替换 `app.asar` 与 `app.asar.unpacked`；将 asar 头部 SHA256 写入 `Info.plist` 的 `ElectronAsarIntegrity`。
-5. 复核写入结果；任一步失败即从备份回滚。
+5. 对 `Docker Desktop.app` 做 ad-hoc 重新签名（见[注意事项](#注意事项)）。
+6. 复核写入结果；任一步失败即从备份回滚。
 
 备份位于 `~/Library/Application Support/DockerDesktop-CN/backup/`，状态文件为同目录下的 `state.json`，后台任务日志在 `~/Library/Logs/DockerDesktop-CN-auto.log`。
 
@@ -47,7 +48,8 @@ bash localize.command
 
 - **先启动一次再汉化。** 从未启动过的 Docker.app 首次启动时系统会做完整评估，此时内容已被改动会被判为“已损坏”。脚本检测到会提醒。
 - **需要 App 管理权限。** 在 系统设置 › 隐私与安全性 › App 管理 中允许所用终端（后台任务需允许 `/bin/bash`），否则写入报 `Operation not permitted`。
-- **`codesign` 提示 `invalid Info.plist` 属预期**，脚本只改动该文件的完整性哈希，绝不向 `.app` 内写入其他文件（多出任何文件都会触发“已损坏”）。
+- **会对 `Docker Desktop.app` 重新签名（ad-hoc）。** 汉化必须改 `Info.plist` 里的 asar 完整性哈希，这会使 Docker 官方签名失效；新版 macOS 在**重启后**重新校验时会直接终止这样的界面进程（Docker 无法打开）。所以写入后脚本会重新签名，让签名与内容一致。代价：界面程序不再带 Docker 官方开发者签名（后台引擎与其余组件不受影响）；`--restore` 还原内容后同样会重新签名，官方签名需重装 Docker Desktop 才能找回。旧版脚本装的汉化会被 `--check` 判为需修复，再运行一次脚本即可补上签名，不重新下载。
+- **脚本绝不向 `.app` 内写入其他文件**（如 `.bak`），外层包多出任何文件都会触发“已损坏”。
 - **信任第三方汉化包。** 它会替换 Docker Desktop 的前端代码；SHA256 只防下载损坏，不能证明来源可信。请确认你信任 `--repo` 指定的仓库。
 - **重装系统 / 迁移 / 换用户名**：脚本不依赖固定路径。Docker 位置按 `/Applications`、`~/Applications`、Spotlight（bundle id）依次查找；状态文件里的备份路径失效时会自动到备份目录重新定位，状态丢失时按哈希找回备份，已是汉化版的 app 会被直接认领。全新系统上只需：安装 Docker → 启动一次并退出 → 运行脚本。
 - Docker.app 属于 root 或其他用户时，用 `sudo bash localize.command`；状态和备份仍记在你自己的家目录下。

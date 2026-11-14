@@ -1,7 +1,9 @@
 #!/bin/bash
 # Docker Desktop 汉化一键安装器 (macOS)
 #
-# 识别本机 Docker Desktop 的版本和架构 -> 到汉化仓库下载对应的汉化包 -> 校验 -> 备份原版 -> 安装汉化。
+# 识别本机 Docker Desktop 的版本和架构 -> 到汉化仓库下载对应的汉化包 -> 校验 -> 备份原版 -> 安装汉化 -> 重新签名。
+# 汉化必须改 Info.plist 里的 asar 完整性哈希，会使 Docker 官方签名失效；新版 macOS 重启后会直接杀掉这样的进程，
+# 所以写入后对 Docker Desktop.app 做一次 ad-hoc 重新签名，让签名与内容重新一致。
 # 只依赖 macOS 自带工具 (bash / curl / unzip / shasum / PlistBuddy / osascript)，不需要 Python、Node。
 #
 # 用法:
@@ -23,7 +25,7 @@
 #   NO_LAUNCH=1        安装后不自动启动 Docker
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.1.0"
+INSTALLER_VERSION="1.2.0"
 
 # 以 sudo 运行时 $HOME 可能是 root 的家目录；状态、备份应归属真实用户
 if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
@@ -217,6 +219,7 @@ APP="$(find_app)" || { [[ "$MODE" == "check" ]] && { missing_msg; exit 11; }; \
 INNER="$APP/Contents/MacOS/Docker Desktop.app/Contents"
 RES="$INNER/Resources"
 INFO="$INNER/Info.plist"
+INNER_APP="${INNER%/Contents}"   # .../Docker Desktop.app (Electron 界面程序，汉化涉及的签名单元)
 
 INSTALLED_VERSION="$(plist_get "$INFO" CFBundleShortVersionString)"
 INSTALLED_BUILD="$(plist_get "$INFO" CFBundleVersion)"
@@ -231,30 +234,52 @@ ASSET="app-Mac-$ARCH.zip"
 
 docker_running() { pgrep -f "$INNER/MacOS/Docker Desktop" >/dev/null 2>&1; }
 
-# 0=已是脚本写入的汉化版 10=未汉化
+# 汉化内容是否已写入 (app.asar 与记录一致)
 localized_status() {
     local patched; patched="$(state_get patched_sha256)"
     [[ -n "$patched" && "$patched" == "$(sha256_of "$RES/app.asar")" ]]
 }
 
+# ---------------------------------------------------------------- 签名
+# 界面程序当前是 ad-hoc 签名 (即本脚本重新签名过的)
+is_adhoc() {
+    local out; out="$(codesign -dv "$INNER_APP" 2>&1 || true)"   # 不用管道+grep -q，避免 SIGPIPE
+    grep -q "^Signature=adhoc" <<<"$out"
+}
+# 签名与当前内容一致，系统重启后重新校验也能通过
+sig_ok() { is_adhoc && codesign --verify --deep --strict "$INNER_APP" >/dev/null 2>&1; }
+# 重新签名: 保留 entitlements，不带 hardened runtime (ad-hoc 加 runtime 会因库校验失败而无法启动)
+resign_inner() {
+    local out
+    out="$(codesign --force --deep --sign - --preserve-metadata=entitlements "$INNER_APP" 2>&1)" \
+        || { printf '%s\n' "$out" >&2; return 1; }
+    codesign --verify --deep --strict "$INNER_APP" >/dev/null 2>&1
+}
+
 if [[ "$MODE" == "check" ]]; then
     if localized_status; then
-        echo "已汉化: Docker Desktop $INSTALLED_VERSION ($ARCH)"; exit 0
+        if sig_ok; then echo "已汉化: Docker Desktop $INSTALLED_VERSION ($ARCH)"; exit 0; fi
+        echo "汉化已写入但签名未修复 (重启 Mac 后 Docker 可能打不开，运行本脚本即可修复): Docker Desktop $INSTALLED_VERSION ($ARCH)"; exit 10
     fi
     echo "未汉化或汉化已失效: Docker Desktop $INSTALLED_VERSION ($ARCH)"; exit 10
 fi
 
 # ---------------------------------------------------------------- 签名封印检查
-# 输出: intact | plist(仅 Info.plist 被改，汉化后的预期状态) | broken(包内多/少了文件) | unsigned
+# 输出: intact | plist(仅 Info.plist 被改) | adhoc(已被本脚本重新签名) | broken(外层包内多/少了文件) | unsigned
+# 界面程序内部的多余文件不算问题: 重新签名时会一并纳入封印
+seal_extras() {  # 外层 Docker.app 里多出/缺失的文件 (界面程序内部的除外)
+    codesign --verify --deep --strict -vv "$APP" 2>&1 | grep -E "^file (added|missing)" | grep -vF "$INNER_APP/" || true
+}
 bundle_state() {
     local out; out="$(codesign --verify --deep --strict -vv "$APP" 2>&1 || true)"
     if grep -qE "not signed at all|bundle format unrecognized" <<<"$out"; then echo unsigned
-    elif grep -qE "^file (added|missing)|a sealed resource is missing" <<<"$out"; then echo broken
+    elif [[ -n "$(seal_extras)" ]]; then echo broken
+    elif is_adhoc; then echo adhoc
+    elif grep -qE "a sealed resource is missing" <<<"$out"; then echo broken
     elif grep -q "invalid Info.plist" <<<"$out"; then echo plist
     elif grep -q "satisfies its Designated Requirement\|valid on disk" <<<"$out"; then echo intact
     else echo broken; fi
 }
-seal_extras() { codesign --verify --deep --strict -vv "$APP" 2>&1 | grep -E "^file (added|missing)" || true; }
 
 # ---------------------------------------------------------------- 还原
 IN_WRITE=0
@@ -268,6 +293,9 @@ restore_from() {  # restore_from <pristine_dir>
     cp -f "$d/app.asar" "$RES/app.asar"
     if [[ -d "$d/app.asar.unpacked" ]]; then replace_dir "$d/app.asar.unpacked" "$RES/app.asar.unpacked"; fi
     if [[ -f "$d/Info.plist" ]] && ! cmp -s "$d/Info.plist" "$INFO"; then cp -f "$d/Info.plist" "$INFO"; fi
+    # 如果界面程序已被重新签名，内容还原后签名要跟着重做，否则签名与内容不一致，重启后 Docker 会打不开
+    # (官方签名只有重装 Docker Desktop 才能找回；功能上没有区别)
+    if is_adhoc; then resign_inner || warn "还原后重新签名失败，请重新安装 Docker Desktop"; fi
     return 0
 }
 on_err() {
@@ -300,13 +328,17 @@ if [[ "$MODE" == "restore" ]]; then
 fi
 
 # ---------------------------------------------------------------- 安装前检查
+REPAIR=0
 if localized_status && [[ $FORCE -eq 0 ]]; then
-    say "已汉化 (Docker Desktop $INSTALLED_VERSION)，无需处理。需要重装请加 --force"; exit 0
+    if sig_ok; then
+        say "已汉化 (Docker Desktop $INSTALLED_VERSION)，无需处理。需要重装请加 --force"; exit 0
+    fi
+    REPAIR=1   # 汉化内容在，但签名没修复 (旧版脚本装的，或签名被还原): 只补签名，不用重新下载
 fi
 
 say "Docker Desktop $INSTALLED_VERSION (构建 $INSTALLED_BUILD, $ARCH)"
 if [[ $AUTO -eq 1 ]]; then
-    say "检测到汉化失效 (Docker 可能刚升级)，开始自动汉化"
+    if [[ $REPAIR -eq 1 ]]; then say "汉化已写入但签名未修复，开始自动修复"; else say "检测到汉化失效 (Docker 可能刚升级)，开始自动汉化"; fi
     LOCK="${TMPDIR:-/tmp}/dockerdesktop-cn-auto.lock"
     mkdir "$LOCK" 2>/dev/null || { echo "已有自动汉化任务在运行，退出"; exit 0; }
     trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
@@ -335,6 +367,34 @@ fi
 # 3) 写权限预检 (Docker.app 属于 root/其他用户时需要 sudo)
 if [[ ! -w "$RES" || ! -w "$RES/app.asar" || ! -w "$INFO" ]]; then
     die "没有修改 Docker.app 的权限 (它可能属于其他用户或 root)。请用 sudo 运行: sudo bash $(basename "$0")"
+fi
+
+# ---------------------------------------------------------------- 仅修复签名
+quit_docker() {  # 返回前设置 WAS_RUNNING
+    WAS_RUNNING=0
+    docker_running || return 0
+    WAS_RUNNING=1
+    say "正在退出 Docker Desktop"
+    osascript -e 'tell application "Docker" to quit' >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do docker_running || break; sleep 1; done
+    pkill -f "$INNER/MacOS/Docker Desktop" >/dev/null 2>&1 || true
+}
+reopen_docker() {
+    if [[ $AUTO -eq 1 ]]; then
+        [[ $WAS_RUNNING -eq 1 ]] && open "$APP" || true
+    elif [[ -z "${NO_LAUNCH:-}" ]]; then
+        ask "现在启动 Docker Desktop 吗？" && open "$APP" || true
+    fi
+}
+if [[ $REPAIR -eq 1 ]]; then
+    quit_docker
+    say "重新签名 Docker Desktop.app (修复签名)"
+    resign_inner || die "重新签名失败。可到 系统设置 > 隐私与安全性 > App 管理 中允许当前终端后重试；仍失败请重新安装 Docker Desktop"
+    own_state
+    say "已修复: 汉化与签名一致，重启 Mac 后也能正常打开 Docker Desktop"
+    notify "Docker Desktop 汉化签名已修复"
+    reopen_docker
+    exit 0
 fi
 
 # ---------------------------------------------------------------- 获取汉化包
@@ -429,6 +489,12 @@ if [[ $FORCE -eq 0 && "$cur_sha" == "$(sha256_of "$PKG/app.asar")" \
     state_write "${PRISTINE:-}" "$cur_sha" "$INSTALLED_VERSION" "$REPO@$VERSION ${ASSET_SHA:-local}"
     own_state
     say "本机已经是该汉化包，已重建状态记录，无需重新安装"
+    if ! sig_ok; then
+        quit_docker
+        say "重新签名 Docker Desktop.app (修复签名)"
+        resign_inner || die "重新签名失败，请重新安装 Docker Desktop"
+        reopen_docker
+    fi
     [[ -n "${PRISTINE:-}" ]] || info "未找到原版备份；之后想还原原版，请重新安装 Docker Desktop"
     exit 0
 fi
@@ -444,8 +510,8 @@ if [[ $REUSE -eq 1 ]]; then
     info "复用已有的原版备份: $PRISTINE"
 else
     # 要把当前文件当作“原版”备份了: 如果 Info.plist 已经被改过，备份到的就不是纯原版
-    if [[ "$BSTATE" == "plist" ]]; then
-        warn "Docker.app 的 Info.plist 已被改动过 (可能用过其他汉化工具)，现在备份到的将不是纯原版，--restore 也只能还原到这个状态。"
+    if [[ "$BSTATE" == "plist" || "$BSTATE" == "adhoc" ]]; then
+        warn "Docker.app 已被改动过 (Info.plist 或签名，可能用过其他汉化工具)，现在备份到的将不是纯原版，--restore 也只能还原到这个状态。"
         if [[ $AUTO -eq 1 ]]; then notify "检测到被其他工具改过，已跳过自动汉化"; exit 0; fi
         ask "建议先重装原版 Docker。仍要继续吗？" || { echo "已取消"; exit 1; }
     fi
@@ -460,14 +526,7 @@ else
     state_write "$PRISTINE" "" "$INSTALLED_VERSION" ""
 fi
 
-WAS_RUNNING=0
-if docker_running; then
-    WAS_RUNNING=1
-    say "正在退出 Docker Desktop"
-    osascript -e 'tell application "Docker" to quit' >/dev/null 2>&1 || true
-    for _ in $(seq 1 30); do docker_running || break; sleep 1; done
-    pkill -f "$INNER/MacOS/Docker Desktop" >/dev/null 2>&1 || true
-fi
+quit_docker
 
 say "安装汉化"
 IN_WRITE=1
@@ -491,6 +550,9 @@ fi
             -c "Add :ElectronAsarIntegrity:Resources/app.asar:hash string $NEW_HASH" "$INFO"; }
 rm -f "$INFO.bak"
 chmod -R a+rX "$RES/app.asar" "$RES/app.asar.unpacked" 2>/dev/null || true
+# 内容和完整性哈希改完后重新签名，否则 Info.plist 与官方签名不一致，系统重启后会直接杀掉 Docker 界面进程
+say "重新签名 Docker Desktop.app"
+resign_inner || die "重新签名失败 (已自动还原)。可到 系统设置 > 隐私与安全性 > App 管理 中允许当前终端后重试"
 IN_WRITE=0
 
 # 校验写入结果
@@ -507,8 +569,4 @@ say "汉化完成 (Docker Desktop $INSTALLED_VERSION)"
 info "还原原版: ./localize.command --restore"
 notify "Docker Desktop 已汉化 ($INSTALLED_VERSION)"
 
-if [[ $AUTO -eq 1 ]]; then
-    [[ $WAS_RUNNING -eq 1 ]] && open "$APP" || true
-elif [[ -z "${NO_LAUNCH:-}" ]]; then
-    ask "现在启动 Docker Desktop 吗？" && open "$APP" || true
-fi
+reopen_docker

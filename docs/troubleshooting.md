@@ -1,4 +1,25 @@
-# 排障：“已损坏”与 “Operation not permitted”
+# 排障
+
+## Docker 打不开（重启 Mac 后尤其常见）
+
+**现象：** 后台引擎和容器仍在运行，但点图标没有界面；终端直接运行界面程序，退出码 `137`（被系统杀掉），`log show` 里有 `amfid ... The signature on the file is invalid`。
+
+**根因：** 汉化改了 `Info.plist` 里的 asar 完整性哈希，界面程序的官方签名随之失效。系统在重启后重新校验时拒绝运行它（重启前靠缓存碰巧能用）。清除隔离标记（`xattr`）**不能**解决。
+
+**处理：** 升级到 1.2.0+ 后重新运行脚本即可，它会检测到“汉化已写入但签名未修复”，只补一次重新签名，不重新下载：
+
+```bash
+bash localize.command          # 或: ./localize.command --check 先看状态 (退出码 10 即需修复)
+```
+
+确认签名状态：
+
+```bash
+codesign -dv "/Applications/Docker.app/Contents/MacOS/Docker Desktop.app" 2>&1 | grep Signature   # 应为 Signature=adhoc
+codesign --verify --deep --strict "/Applications/Docker.app/Contents/MacOS/Docker Desktop.app" && echo 签名一致
+```
+
+重新签名要求不带 hardened runtime（ad-hoc 加 runtime 会因库校验失败，报 `Library not loaded ... different Team IDs`），脚本已按此处理，不要手动加 `--options runtime`。
 
 ## “Docker.app 已损坏，无法打开”
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-macOS 上 Docker Desktop 汉化一键安装器。单文件 bash 脚本 `localize.command`：识别本机 Docker 版本/构建号/架构 → 从汉化仓库（默认 `asxez/DockerDesktop-CN`）的 Release 下载匹配的 `app-Mac-{apple,intel}.zip` → 校验 → 备份原版 → 替换 `app.asar` 与 `app.asar.unpacked` 并改写 `Info.plist` 里的完整性哈希。本仓库**不构建、不分发**汉化包。
+macOS 上 Docker Desktop 汉化一键安装器。单文件 bash 脚本 `localize.command`：识别本机 Docker 版本/构建号/架构 → 从汉化仓库（默认 `asxez/DockerDesktop-CN`）的 Release 下载匹配的 `app-Mac-{apple,intel}.zip` → 校验 → 备份原版 → 替换 `app.asar` 与 `app.asar.unpacked` 并改写 `Info.plist` 里的完整性哈希 → 对 `Docker Desktop.app` 做 ad-hoc 重新签名。本仓库**不构建、不分发**汉化包。
 
 ## 命令
 
@@ -17,10 +17,11 @@ bash -n localize.command          # 语法检查，改完脚本必跑
 - `localize.command` 自上而下依次是：参数解析 → 工具函数 → 后台任务(launchd) → 定位 Docker → `--check`/`--restore` → 安装前检查 → 获取并校验汉化包 → 备份 → 写入 → 校验 → 记录状态。
 - 状态在 `~/Library/Application Support/DockerDesktop-CN/`：`state.json`（原版备份位置、汉化版 `app.asar` 哈希、版本、来源）、`backup/<时间>-orig-<版本>/`、`config`（持久化的 `DDCN_*` 设置）。
 - `state.json` 的键名（`pristine_dir` / `patched_sha256` / `version`）与汉化原仓库的 Python 工具兼容，**不要改名**。
-- "已汉化"的判据是：当前 `app.asar` 的 SHA256 == `state.json` 的 `patched_sha256`。Docker 升级会覆盖文件，该判据随之失效，`--auto` 据此重装。
+- "已汉化"的判据是：当前 `app.asar` 的 SHA256 == `state.json` 的 `patched_sha256`，**并且** `sig_ok`（界面程序为 ad-hoc 签名且 `codesign --verify --deep --strict` 通过）。Docker 升级会覆盖文件，该判据随之失效，`--auto` 据此重装；只有签名不对而内容已汉化时走 `REPAIR` 分支，只补签名不下载。
 
 ## 必须遵守（都是踩过的坑）
 
+- **写入后必须重新签名，且签名要与内容同步。** 改了 `Info.plist` 哈希就会让官方签名失效，新版 macOS **重启后**会直接杀掉界面进程（退出码 137，amfid -420），清除隔离标记无效。`resign_inner` 用 `codesign --force --deep --sign - --preserve-metadata=entitlements`，**不能加 `--options runtime`**（ad-hoc + hardened runtime 会因库校验报 “different Team IDs” 而起不来）。`restore_from` 在界面程序已是 ad-hoc 时会在还原内容后重新签名，否则签名与内容不一致。只重签 `Docker Desktop.app`，**不要碰外层 Docker.app 与 `com.docker.*` 组件**（带受限 entitlements/描述文件，重签会破坏虚拟化与网络）。
 - **绝不往 `.app` 包里写除 `app.asar`、`app.asar.unpacked`、`Info.plist` 中完整性哈希之外的任何东西**（包括 `.bak`）。包内多出任何文件会破坏签名封印，系统提示“已损坏”。备份只放在 `backup/`。
 - **写入阶段的失败必须回滚。** 所有会修改 `.app` 的步骤都放在 `IN_WRITE=1` 窗口内；出错一律走 `die()`（它会先 `restore_from`），不要裸 `exit`——`exit` 不会触发 ERR trap。
 - **目录替换用 `replace_dir`**，不要 `rm -rf` 后直接 `cp -R A B`：删除失败时 B 仍存在，会变成 `B/A` 嵌套。
@@ -40,6 +41,7 @@ bash -n localize.command          # 语法检查，改完脚本必跑
 
 - **永远不要拿真实的 `/Applications/Docker.app` 做破坏性测试，也不要在测试里退出用户正在运行的 Docker。** 测试用“假 Docker.app + 临时家目录”，通过环境变量隔离：`DDCN_DOCKER_APP`（指向假 app）、`DDCN_HOME`（状态/备份目录）。`docker_running` 的 `pgrep` 是按 app 路径匹配的，所以不会误杀真实 Docker。
 - 仅供测试的环境变量：`DDCN_ARCH=apple|intel`（绕过 `lipo`）、`DDCN_ASSUME_LAUNCHED=1`（跳过“是否启动过”检查）、`DDCN_AUTO_DELAY=1`（缩短自动模式等待）、`NO_LAUNCH=1`（不启动 Docker）。
+- 测试里的假 Docker.app 带一个可签名的占位主程序（复制 `/usr/bin/true`）；重签失败用桩 `codesign`（`--force` 时返回 1）放在 `PATH` 前面模拟。**没有覆盖的**：重启后的系统重新校验（只能在真机重启验证）、真实 Electron 的完整启动。
 - 新增/修改写入逻辑时，要在 `tests/run.sh` 里补用例，并**确认失败注入真的走到了你要测的代码**：用 `chflags uchg` 锁一个文件可以制造“权限位可写但实际写不进去”的失败（等价于 App Management 拦截），但锁 `Info.plist` 会先被写权限预检拦下，要测回滚应锁 `app.asar.unpacked` 里的文件。
 - 开发用 shell 里 `rm` 可能被别名为 `trash`（目标不存在时报错并中断 `&&` 链），脚本和测试里用 `/bin/rm`。
 
